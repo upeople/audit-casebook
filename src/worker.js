@@ -26,7 +26,7 @@ export default {
         {
           success: false,
           error: "METHOD_NOT_ALLOWED",
-          message: "현재는 GET 요청만 지원합니다.",
+          message: "현재는 GET 요청만 지원합니다..",
         },
         405,
         {
