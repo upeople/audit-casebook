@@ -1,0 +1,30 @@
+{
+  "name": "audit-casebook",
+  "main": "src/worker.js",
+  "workers_dev": true,
+  "preview_urls": false,
+  "compatibility_date": "2026-07-31",
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1,
+    "redact_query_string": false,
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 1,
+      "persist": true,
+      "invocation_logs": true
+    },
+    "traces": {
+      "enabled": false,
+      "persist": true,
+      "head_sampling_rate": 1
+    }
+  },
+  "services": [
+    {
+      "binding": "AUDIT_SERVICE",
+      "service": "audit2026",
+      "environment": "production"
+    }
+  ]
+}
