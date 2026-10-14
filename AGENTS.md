@@ -1,41 +1,276 @@
-# Cloudflare Workers
+# AGENTS.md
 
-STOP. Your knowledge of Cloudflare Workers APIs and limits may be outdated. Always retrieve current documentation before any Workers, KV, R2, D1, Durable Objects, Queues, Vectorize, AI, or Agents SDK task.
+## 프로젝트 개요
 
-## Docs
+이 프로젝트는 Cloudflare Workers 기반의 감사사례 검색 서비스이다.
 
-- https://developers.cloudflare.com/workers/
-- MCP: `https://docs.mcp.cloudflare.com/mcp`
+프로젝트명:
+- audit-casebook
 
-For all limits and quotas, retrieve from the product's `/platform/limits/` page. eg. `/workers/platform/limits`
+주요 목적:
+- 감사사례 검색
+- 감사 지적사항 및 처분사례 조회
+- 사용자 검색어에 대한 관련 사례 제공
+- 향후 검색 정확도와 응답속도 개선
 
-## Commands
+운영 환경:
+- Cloudflare Workers
+- GitHub
+- Production Branch: main
+- GitHub push 후 Cloudflare 자동 배포
+- JavaScript
+- Wrangler
+- npm
 
-| Command | Purpose |
-|---------|---------|
-| `npx wrangler dev` | Local development |
-| `npx wrangler deploy` | Deploy to Cloudflare |
-| `npx wrangler types` | Generate TypeScript types |
+---
 
-Run `wrangler types` after changing bindings in wrangler.jsonc.
+## 개발 기본 원칙
 
-## Node.js Compatibility
+1. 기존 운영 기능을 우선 보존한다.
+2. 사용 중인 API endpoint를 임의로 변경하지 않는다.
+3. 기존 응답 JSON 구조를 가능한 한 유지한다.
+4. 기존 검색 결과의 품질을 훼손하지 않는다.
+5. 대규모 재작성보다 최소 수정과 단계적 개선을 우선한다.
+6. 수정 전 현재 코드의 실행 흐름을 먼저 파악한다.
+7. 확인하지 못한 부분을 추측해서 구현하지 않는다.
+8. 불필요한 라이브러리를 추가하지 않는다.
+9. Cloudflare 비용이나 호출량이 증가하는 변경은 사전에 영향도를 분석한다.
+10. 운영 중인 기능을 임의로 제거하지 않는다.
 
-https://developers.cloudflare.com/workers/runtime-apis/nodejs/
+---
 
-## Errors
+## 작업 절차
 
-- **Error 1102** (CPU/Memory exceeded): Retrieve limits from `/workers/platform/limits/`
-- **All errors**: https://developers.cloudflare.com/workers/observability/errors/
+단순한 오탈자 수정이 아닌 경우 다음 절차를 따른다.
 
-## Product Docs
+1. 저장소 전체 구조를 확인한다.
+2. 진입점과 주요 라우팅 구조를 확인한다.
+3. 검색 요청이 어떤 흐름으로 처리되는지 분석한다.
+4. 외부 API, DB, Vector 검색, 다른 Worker 호출 여부를 확인한다.
+5. 현재 문제점과 개선 가능성을 정리한다.
+6. 수정 대상 파일과 수정 범위를 제시한다.
+7. 기존 기능에 미칠 영향을 설명한다.
+8. 필요한 최소 범위만 수정한다.
+9. 수정 후 기존 기능의 회귀 가능성을 다시 점검한다.
 
-Retrieve API references and limits from:
-`/kv/` · `/r2/` · `/d1/` · `/durable-objects/` · `/queues/` · `/vectorize/` · `/workers-ai/` · `/agents/`
+큰 구조 변경은 바로 실행하지 말고 먼저 계획을 제시한다.
 
-## Best Practices (conditional)
+---
 
-If the application uses Durable Objects or Workflows, refer to the relevant best practices:
+## audit-casebook 핵심 확인 항목
 
-- Durable Objects: https://developers.cloudflare.com/durable-objects/best-practices/rules-of-durable-objects/
-- Workflows: https://developers.cloudflare.com/workflows/build/rules-of-workflows/
+이 프로젝트를 수정할 때 특히 다음을 확인한다.
+
+- 검색어 전처리
+- 검색 API 라우팅
+- 검색 결과 ranking
+- 결과 정렬 기준
+- 동일 문서의 중복 노출
+- 검색 결과 개수 제한
+- 문서별 최대 노출 개수
+- 검색어가 짧거나 모호한 경우의 처리
+- 한글 검색어 처리
+- 부분일치 및 유사어 검색
+- 검색 실패 시 fallback
+- 응답속도
+- API 호출 횟수
+- 캐시 가능 여부
+- Cloudflare Worker CPU 사용량
+- 외부 호출 timeout
+- 오류 처리
+
+---
+
+## 검색 품질 개선 원칙
+
+검색 품질 개선 시 단순히 결과 개수를 늘리는 방식은 피한다.
+
+다음 순서로 검토한다.
+
+1. 검색어 정규화
+2. 불필요한 조사 또는 표현 처리
+3. 핵심 키워드 추출
+4. 정확 일치
+5. 부분 일치
+6. 의미 기반 검색
+7. ranking
+8. 중복 제거
+9. 문서별 결과 제한
+10. 최종 결과 정렬
+
+검색 정확도와 응답속도를 함께 고려한다.
+
+검색 결과가 많아져도 관련성이 낮아지면 개선으로 간주하지 않는다.
+
+---
+
+## 성능 개선 원칙
+
+성능 개선 시 다음을 우선 확인한다.
+
+- 동일 요청의 중복 처리
+- 동일 API의 반복 호출
+- 순차 처리 중 병렬화 가능한 부분
+- 불필요한 JSON parsing
+- 불필요한 전체 데이터 조회
+- 과도하게 큰 응답
+- 동일 문서의 반복 검색
+- 캐싱 가능 여부
+- Cloudflare Cache API 활용 가능 여부
+- 외부 Worker 또는 API 호출 횟수
+- timeout 설정
+
+성능 개선을 이유로 검색 기능을 단순화하거나 정확도를 임의로 낮추지 않는다.
+
+---
+
+## API 호환성
+
+기존 API를 수정할 때 하위 호환성을 우선한다.
+
+다음 항목은 임의로 변경하지 않는다.
+
+- endpoint URL
+- HTTP method
+- query parameter 이름
+- JSON key 이름
+- response 구조
+- status code 의미
+- CORS 설정
+
+변경이 필요한 경우 먼저 코드 전체에서 해당 API의 호출처를 검색한다.
+
+---
+
+## Cloudflare 관련 주의사항
+
+다음 항목을 수정할 때는 기존 설정의 역할을 먼저 확인한다.
+
+- wrangler.json
+- wrangler.jsonc
+- wrangler.toml
+- bindings
+- KV
+- D1
+- R2
+- Vectorize
+- Workers AI
+- Service Binding
+- environment variables
+- routes
+- cron triggers
+
+기존 binding 이름이나 resource 이름은 특별한 이유가 없는 한 변경하지 않는다.
+
+---
+
+## 보안 원칙
+
+다음 정보는 코드 또는 GitHub에 포함하지 않는다.
+
+- API Key
+- Cloudflare API Token
+- Password
+- Secret
+- 개인 인증정보
+- 민감한 내부정보
+
+다음 파일이 있다면 Git 추적 대상인지 확인한다.
+
+- .env
+- .dev.vars
+- secrets
+- credentials
+
+비밀값이 발견되면 그대로 출력하지 않는다.
+
+---
+
+## 코드 품질
+
+코드 수정 시 다음 기준을 따른다.
+
+- 함수는 가능한 한 하나의 역할을 수행한다.
+- 중복 코드를 줄인다.
+- 변수명과 함수명은 역할이 명확해야 한다.
+- 지나치게 긴 함수는 필요하면 분리한다.
+- 하드코딩을 줄인다.
+- 기존 코드 스타일을 가능한 한 유지한다.
+- 설명 없는 복잡한 최적화를 피한다.
+- 성능보다 가독성이 중요한 부분은 지나친 최적화를 하지 않는다.
+
+---
+
+## 오류 처리
+
+검색이나 외부 호출 실패 시 가능한 범위에서 원인을 구분한다.
+
+예:
+- 잘못된 입력값
+- 검색 결과 없음
+- 외부 API 오류
+- 데이터베이스 오류
+- Vector 검색 오류
+- timeout
+- Cloudflare Worker 오류
+
+사용자 응답에 내부 stack trace나 비밀정보가 노출되지 않도록 한다.
+
+---
+
+## 테스트
+
+수정 후 가능한 범위에서 다음을 확인한다.
+
+- 기본 검색
+- 한글 검색
+- 짧은 검색어
+- 여러 단어 검색
+- 검색 결과 없음
+- 중복 결과
+- 결과 정렬
+- 결과 개수 제한
+- API response JSON
+- CORS
+- 브라우저 콘솔 오류
+- Cloudflare 배포 오류
+
+가능하면 수정 전과 수정 후 결과를 비교한다.
+
+---
+
+## Git 작업 원칙
+
+main 브랜치는 운영 배포 브랜치이다.
+
+큰 변경은 별도 브랜치 사용을 권장한다.
+
+예:
+- feature/search-ranking
+- perf/search-speed
+- fix/search-error
+- refactor/search-pipeline
+
+커밋 메시지는 변경 내용을 알 수 있게 작성한다.
+
+예:
+- feat: 검색어 정규화 추가
+- fix: 중복 검색 결과 제거
+- perf: 검색 API 호출 횟수 감소
+- refactor: 검색 처리 로직 분리
+
+---
+
+## 작업 완료 보고
+
+작업 후 다음 항목을 간단히 정리한다.
+
+1. 수정한 파일
+2. 수정 내용
+3. 수정 이유
+4. 예상 효과
+5. 기존 기능 영향
+6. 테스트 결과
+7. 추가 확인이 필요한 사항
+
+확인하지 못한 것은 확인하지 못했다고 명확히 표시한다.

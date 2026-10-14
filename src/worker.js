@@ -1,16 +1,25 @@
 const APP_NAME = "종합감사 디지털 사례집";
 const SERVICE_NAME = "audit-casebook";
-const APP_VERSION = "0.10.0";
-const CUSTOM_GPT_URL =
-  "https://chatgpt.com/g/g-6a66adef123c81918d6736b28c8199c5-jonghabgamsa-sarye-bogmumaenyueol-sagyu";
+const APP_VERSION = "0.11.0";
 
 const DEFAULT_SEARCH_LIMIT = 8;
 const MAX_SEARCH_LIMIT = 20;
 const MAX_QUERY_LENGTH = 200;
+const MAX_ASK_LENGTH = 2000;
+const MAX_ASK_CONTEXT_LENGTH = 12000;
+const ASK_TIMEOUT_MS = 60000;
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+
+    if (url.pathname === "/api/ask") {
+      if (request.method !== "POST") {
+        return jsonResponse({ success: false, error: "METHOD_NOT_ALLOWED",
+          message: "질문은 POST 요청으로 보내 주세요." }, 405, { Allow: "POST" });
+      }
+      return proxyAuditAsk(request, env);
+    }
 
     if (request.method !== "GET" && request.method !== "HEAD") {
       return jsonResponse(
@@ -49,8 +58,9 @@ export default {
         statisticsApiAvailable: true,
         categoryDonutAvailable: true,
         categoryDonutLabelsAvailable: true,
-        customGptAvailable: true,
-        customGptClipboardAvailable: true,
+        customGptAvailable: false,
+        customGptClipboardAvailable: false,
+        analysisChatAvailable: bindingConfigured,
         message: bindingConfigured
           ? "검색, 상세보기, 필터 및 통계 화면이 정상 설정되어 있습니다."
           : "웹페이지는 작동하지만 AUDIT_SERVICE Binding이 없습니다.",
@@ -307,6 +317,117 @@ async function proxyAuditSearch(url, env) {
       "audit2026 검색 호출 중 오류가 발생했습니다.",
       error
     );
+  }
+}
+
+async function proxyAuditAsk(request, env) {
+  // Only the same-origin UI may submit browser requests to this endpoint.
+  const origin = request.headers.get("Origin");
+  if (origin && origin !== new URL(request.url).origin) {
+    return jsonResponse({ success: false, error: "ORIGIN_NOT_ALLOWED",
+      message: "이 페이지에서 질문을 보내 주세요." }, 403);
+  }
+  if (!hasAuditServiceBinding(env)) return serviceBindingMissingResponse();
+  if ((request.headers.get("Content-Type") || "").split(";")[0].trim().toLowerCase() !== "application/json") {
+    return jsonResponse({ success: false, error: "INVALID_CONTENT_TYPE",
+      message: "질문을 JSON 형식으로 보내 주세요." }, 415);
+  }
+
+  let body;
+  try {
+    // Bound streamed input as well as requests without Content-Length.
+    const reader = request.body?.getReader();
+    if (!reader) throw new Error("EMPTY_BODY");
+    const chunks = [];
+    let size = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > 100000) {
+        await reader.cancel();
+        return jsonResponse({ success: false, error: "REQUEST_TOO_LARGE",
+          message: "질문과 대화 내용이 너무 깁니다. 새 대화를 시작해 주세요." }, 413);
+      }
+      chunks.push(value);
+    }
+    const bytes = new Uint8Array(size);
+    let offset = 0;
+    for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+    body = JSON.parse(new TextDecoder().decode(bytes));
+  } catch {
+    return jsonResponse({ success: false, error: "INVALID_JSON",
+      message: "질문 요청을 읽을 수 없습니다." }, 400);
+  }
+
+  const question = typeof body?.question === "string" ? body.question.trim() : "";
+  const context = body?.context ?? "";
+  const history = body?.history ?? [];
+  if (!question || question.length > MAX_ASK_LENGTH) {
+    return jsonResponse({ success: false, error: "INVALID_QUESTION",
+      message: `질문은 1~${MAX_ASK_LENGTH}자로 입력해 주세요.` }, 400);
+  }
+  if (typeof context !== "string" || context.length > MAX_ASK_CONTEXT_LENGTH ||
+      !Array.isArray(history) || history.length > 6 || history.some(item =>
+        !item || !["user", "assistant"].includes(item.role) ||
+        typeof item.content !== "string" || item.content.length > 2000)) {
+    return jsonResponse({ success: false, error: "INVALID_CHAT_CONTEXT",
+      message: "대화 내용이 너무 길거나 형식이 올바르지 않습니다." }, 400);
+  }
+
+  const prompt = [
+    "현재 질문에 한국어로 답변하세요. 이전 대화는 후속 질문을 이해하는 참고 자료입니다.",
+    "선택한 사례와 검색된 사례를 구분하고, 확인할 수 없는 근거는 확인 불가라고 표시하세요.",
+    context ? "[선택한 검색 주제 또는 사례]\n" + context : "",
+    history.length ? "[이전 대화]\n" + history.map(item =>
+      (item.role === "user" ? "사용자: " : "답변: ") + item.content).join("\n\n") : "",
+    "[현재 질문]\n" + question
+  ].filter(Boolean).join("\n\n");
+  const controller = new AbortController();
+  let timedOut = false;
+  let timer;
+  try {
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+        reject(new Error("ASK_TIMEOUT"));
+      }, ASK_TIMEOUT_MS);
+    });
+    const upstreamResult = await Promise.race([
+      (async () => {
+        // The existing POST tool endpoint avoids placing questions in URLs.
+        const response = await env.AUDIT_SERVICE.fetch(new Request(
+          "https://audit2026.internal/execute", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Accept: "application/json" },
+            body: JSON.stringify({ tool: "ask_audit_cases", arguments: { query: prompt } }),
+            signal: controller.signal
+          }
+        ));
+        return { response, parsed: await parseUpstreamJson(response) };
+      })(), timeout
+    ]);
+    const { response, parsed } = upstreamResult;
+    if (!response.ok || !parsed.validJson || parsed.data?.ok !== true ||
+        parsed.data?.raw?.success === false || typeof parsed.data?.answer !== "string" ||
+        !parsed.data.answer.trim()) {
+      return jsonResponse({ success: false, error: "AUDIT_ASK_ERROR",
+        message: "답변을 생성하지 못했습니다. 잠시 후 다시 질문해 주세요." }, 502);
+    }
+    const sources = Array.isArray(parsed.data.sources) ? parsed.data.sources : [];
+    return jsonResponse({ success: true, answer: parsed.data.answer,
+      sources: sources.slice(0, 3).map(item => ({
+        title: String(item?.title || "제목 없음"),
+        year: item?.year == null ? null : String(item.year),
+        sourceFile: String(item?.source_file || item?.sourceFile || "")
+      })) });
+  } catch {
+    return jsonResponse({ success: false, error: timedOut ? "ASK_TIMEOUT" : "AUDIT_ASK_CONNECTION_FAILED",
+      message: timedOut ? "답변 생성 시간이 길어지고 있습니다. 질문을 줄여 다시 시도해 주세요."
+        : "분석 서비스에 연결하지 못했습니다. 잠시 후 다시 시도해 주세요." }, timedOut ? 504 : 502);
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -1567,26 +1688,25 @@ function getHomePage() {
       padding-left: 21px;
     }
 
-    .gpt-toast {
-      position: fixed;
-      right: 22px;
-      bottom: 22px;
-      z-index: 1000;
-      max-width: min(430px, calc(100% - 32px));
-      padding: 13px 16px;
-      color: var(--white);
-      background: var(--navy-950);
-      border: 1px solid rgba(255, 255, 255, 0.2);
-      border-radius: 9px;
-      box-shadow: 0 9px 28px rgba(16, 42, 67, 0.28);
-      font-size: 0.9rem;
-      font-weight: 800;
-      line-height: 1.5;
-    }
-
-    .gpt-toast.error {
-      background: #8b2f2f;
-    }
+    .analysis-dialog { width: min(820px, calc(100% - 24px)); }
+    .analysis-inner { height: min(780px, 90vh); height: min(780px, 90dvh); }
+    .analysis-intro { margin: 0; padding: 14px 20px; color: var(--gray-700); background: var(--gray-100); font-size: 0.875rem; }
+    .analysis-context { display: block; margin-top: 6px; font-weight: 700; overflow-wrap: anywhere; }
+    .analysis-messages { flex: 1; min-height: 0; overflow-y: auto; padding: 20px; }
+    .analysis-message { margin-bottom: 16px; padding: 14px 16px; background: var(--gray-100); border-radius: 12px; overflow-wrap: anywhere; }
+    .analysis-message.user { margin-left: 32px; background: var(--blue-100); }
+    .analysis-message.assistant { margin-right: 16px; border: 1px solid var(--gray-200); }
+    .analysis-message-label { display: block; margin-bottom: 8px; color: var(--navy-900); }
+    .analysis-message-text { margin: 0; white-space: pre-wrap; line-height: 1.7; }
+    .analysis-sources { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--gray-200); font-size: 0.85rem; }
+    .analysis-sources ul { margin: 8px 0 0; padding-left: 20px; }
+    .analysis-status { margin: 0; padding: 0 20px 12px; color: var(--gray-700); }
+    .analysis-error { margin: 0 20px 12px; padding: 10px 12px; color: #8b2f2f; background: #fff1f1; border-radius: 8px; }
+    .analysis-form { padding: 16px 20px; border-top: 1px solid var(--gray-200); }
+    .analysis-form label { display: block; margin-bottom: 8px; font-weight: 700; }
+    .analysis-input { width: 100%; min-height: 88px; max-height: 180px; resize: vertical; padding: 12px; border: 1px solid var(--gray-300); border-radius: 8px; font: inherit; }
+    .analysis-actions { display: flex; justify-content: space-between; gap: 12px; margin-top: 10px; }
+    .analysis-clear { padding: 10px 14px; color: var(--navy-900); background: var(--white); border: 1px solid var(--gray-300); border-radius: 8px; }
 
     [hidden] {
       display: none !important;
@@ -1831,10 +1951,10 @@ function getHomePage() {
           class="gpt-button"
           type="button"
         >
-          Custom GPT에서 분석하기
+          AI 분석 · 질문하기
         </button>
         <span class="gpt-action-guide">
-          검색어를 클립보드에 복사한 뒤 통합 GPT를 엽니다.
+          분석 팝업에서 감사사례를 질문하고 답변을 확인합니다.
         </span>
       </div>
 
@@ -1917,8 +2037,8 @@ function getHomePage() {
 
     <div class="system-note">
       관련도는 audit2026의 키워드 일치와 의미 유사검색 결과를
-      함께 반영합니다. 이 웹페이지는 생성형 답변을 작성하지 않으며,
-      분석 버튼은 내용을 복사한 뒤 연결된 Custom GPT를 엽니다.
+      함께 반영합니다. 분석 팝업에서는 감사사례를 바탕으로 AI 답변을
+      제공합니다. 답변의 근거와 원문을 함께 확인해 주세요.
     </div>
   </main>
 
@@ -1973,10 +2093,10 @@ function getHomePage() {
               type="button"
               disabled
             >
-              이 사례를 Custom GPT에서 분석
+              이 사례 분석 · 질문하기
             </button>
             <span class="detail-gpt-guide">
-              전체 사례 내용을 복사한 뒤 통합 GPT를 엽니다.
+              전체 사례 내용을 바탕으로 팝업에서 질문합니다.
             </span>
           </div>
           <p
@@ -1991,18 +2111,32 @@ function getHomePage() {
     </div>
   </dialog>
 
-  <div
-    id="gptToast"
-    class="gpt-toast"
-    role="status"
-    aria-live="polite"
-    hidden
-  ></div>
+  <dialog id="analysisDialog" class="detail-dialog analysis-dialog" aria-labelledby="analysisHeading">
+    <div class="detail-dialog-inner analysis-inner">
+      <div class="detail-dialog-header">
+        <h2 id="analysisHeading" class="detail-heading">감사사례 AI 분석</h2>
+        <button id="analysisClose" class="detail-close" type="button" aria-label="분석 팝업 닫기">×</button>
+      </div>
+      <p class="analysis-intro">
+        감사사례를 참고해 AI가 답변합니다. 후속 질문을 이어서 할 수 있습니다.
+        <span id="analysisContext" class="analysis-context"></span>
+      </p>
+      <div id="analysisMessages" class="analysis-messages" role="log" aria-label="질문과 답변" aria-live="polite"></div>
+      <p id="analysisStatus" class="analysis-status" role="status" hidden>관련 사례를 찾아 답변을 작성하고 있습니다…</p>
+      <p id="analysisError" class="analysis-error" role="alert" hidden></p>
+      <form id="analysisForm" class="analysis-form">
+        <label for="analysisInput">질문</label>
+        <textarea id="analysisInput" class="analysis-input" maxlength="${MAX_ASK_LENGTH}" required placeholder="궁금한 점을 입력해 주세요. 예: 이 사례의 주요 문제점과 개선방안은 무엇인가요?"></textarea>
+        <div class="analysis-actions">
+          <button id="analysisClear" class="analysis-clear" type="button">새 대화</button>
+          <button id="analysisSend" class="gpt-button" type="submit">질문 보내기</button>
+        </div>
+      </form>
+    </div>
+  </dialog>
 
   <script>
     (function () {
-      var CUSTOM_GPT_URL =
-        ${JSON.stringify(CUSTOM_GPT_URL)};
       var searchForm =
         document.getElementById("searchForm");
       var searchInput =
@@ -2039,8 +2173,16 @@ function getHomePage() {
         document.querySelectorAll(".example-button");
       var searchGptButton =
         document.getElementById("searchGptButton");
-      var gptToast =
-        document.getElementById("gptToast");
+      var analysisDialog = document.getElementById("analysisDialog");
+      var analysisMessages = document.getElementById("analysisMessages");
+      var analysisInput = document.getElementById("analysisInput");
+      var analysisSend = document.getElementById("analysisSend");
+      var analysisStatus = document.getElementById("analysisStatus");
+      var analysisError = document.getElementById("analysisError");
+      var analysisContextText = "";
+      var analysisHistory = [];
+      var activeAnalysisController = null;
+      var lastAnalysisTrigger = null;
 
       var detailDialog =
         document.getElementById("detailDialog");
@@ -2071,7 +2213,6 @@ function getHomePage() {
       var activeDetailController = null;
       var lastDetailTrigger = null;
       var currentDetailData = null;
-      var gptToastTimer = null;
       var dispositionOptions = {
         administrative: {
           allLabel: "행정상 처분 전체",
@@ -2140,11 +2281,12 @@ function getHomePage() {
       searchGptButton.addEventListener(
         "click",
         function () {
-          openCustomGpt(
+          openAnalysisChat(
             buildSearchGptText(
               String(searchInput.value || "").trim()
             ),
-            "검색어가 복사되었습니다. 열린 Custom GPT에서 붙여넣어 주세요."
+            "검색 주제: " + (String(searchInput.value || "").trim() || "감사사례"),
+            searchGptButton
           );
         }
       );
@@ -2196,16 +2338,13 @@ function getHomePage() {
         "click",
         function () {
           if (!currentDetailData) {
-            showGptToast(
-              "상세 사례를 먼저 불러와 주세요.",
-              true
-            );
             return;
           }
 
-          openCustomGpt(
+          openAnalysisChat(
             buildDetailGptText(currentDetailData),
-            "전체 사례 내용이 복사되었습니다. 열린 Custom GPT에서 붙여넣어 주세요."
+            "선택한 사례: " + safeText(currentDetailData.title, "제목 없음"),
+            detailGptButton
           );
         }
       );
@@ -2213,7 +2352,7 @@ function getHomePage() {
       detailDialog.addEventListener(
         "close",
         function () {
-          document.body.classList.remove("modal-open");
+          if (!analysisDialog.open) document.body.classList.remove("modal-open");
 
           if (activeDetailController) {
             activeDetailController.abort();
@@ -2683,15 +2822,16 @@ function getHomePage() {
           makeElement(
             "button",
             "gpt-button",
-            "Custom GPT에서 분석"
+            "AI 분석 · 질문하기"
           );
         gptButton.type = "button";
         gptButton.addEventListener(
           "click",
           function () {
-            openCustomGpt(
+            openAnalysisChat(
               buildCardGptText(item),
-              "선택한 사례가 복사되었습니다. 열린 Custom GPT에서 붙여넣어 주세요."
+              "선택한 사례: " + safeText(item.title, "제목 없음"),
+              gptButton
             );
           }
         );
@@ -3513,10 +3653,10 @@ function getHomePage() {
 
       function buildSearchGptText(query) {
         var topic = query ||
-          "감사사례, 복무매뉴얼 및 사규 관련 질문";
+          "감사사례 관련 질문";
 
         return [
-          "다음 주제를 종합감사 사례, 복무매뉴얼, 사규를 함께 참고하여 분석해 주세요.",
+          "다음 주제의 감사사례를 참고하여 분석해 주세요.",
           "",
           "[검색 주제]",
           topic,
@@ -3527,7 +3667,7 @@ function getHomePage() {
 
       function buildCardGptText(item) {
         return [
-          "다음 감사사례를 종합감사 사례, 복무매뉴얼, 사규와 함께 비교·분석해 주세요.",
+          "다음 감사사례를 참고하여 분석해 주세요.",
           "",
           "[현재 검색어]",
           safeText(
@@ -3554,7 +3694,7 @@ function getHomePage() {
 
       function buildDetailGptText(caseData) {
         var lines = [
-          "다음 감사사례의 전체 내용을 종합감사 사례, 복무매뉴얼, 사규와 함께 비교·분석해 주세요.",
+          "다음 감사사례의 전체 내용을 참고하여 분석해 주세요.",
           "",
           "[감사사례 기본정보]",
           "사례 ID: " +
@@ -3636,65 +3776,131 @@ function getHomePage() {
         return safeText(block.text, "");
       }
 
-      function openCustomGpt(text, successMessage) {
-        window.open(
-          CUSTOM_GPT_URL,
-          "_blank",
-          "noopener,noreferrer"
-        );
+      document.getElementById("analysisClose").addEventListener("click", function () {
+        analysisDialog.close();
+      });
+      analysisDialog.addEventListener("click", function (event) {
+        if (event.target === analysisDialog) analysisDialog.close();
+      });
+      analysisDialog.addEventListener("close", function () {
+        cancelAnalysisRequest();
+        if (!detailDialog.open) document.body.classList.remove("modal-open");
+        if (lastAnalysisTrigger) lastAnalysisTrigger.focus();
+      });
+      document.getElementById("analysisClear").addEventListener("click", resetAnalysisConversation);
+      document.getElementById("analysisForm").addEventListener("submit", function (event) {
+        event.preventDefault();
+        sendAnalysisQuestion();
+      });
 
-        copyTextToClipboard(text)
-          .then(function () {
-            showGptToast(successMessage, false);
-          })
-          .catch(function () {
-            showGptToast(
-              "클립보드 복사에 실패했습니다. 열린 Custom GPT에 내용을 직접 입력해 주세요.",
-              true
-            );
-          });
+      function openAnalysisChat(context, label, trigger) {
+        var nextContext = String(context || "").slice(0, ${MAX_ASK_CONTEXT_LENGTH});
+        if (nextContext !== analysisContextText) {
+          analysisContextText = nextContext;
+          resetAnalysisConversation();
+        }
+        document.getElementById("analysisContext").textContent = label;
+        lastAnalysisTrigger = trigger;
+        if (!analysisDialog.open) analysisDialog.showModal();
+        document.body.classList.add("modal-open");
+        analysisInput.focus();
       }
 
-      async function copyTextToClipboard(text) {
-        if (
-          navigator.clipboard &&
-          window.isSecureContext
-        ) {
-          await navigator.clipboard.writeText(text);
+      function cancelAnalysisRequest() {
+        if (activeAnalysisController) activeAnalysisController.abort();
+        activeAnalysisController = null;
+        setAnalysisLoading(false);
+      }
+
+      function resetAnalysisConversation() {
+        cancelAnalysisRequest();
+        analysisHistory = [];
+        analysisMessages.textContent = "";
+        analysisInput.value = "";
+        analysisError.hidden = true;
+        appendAnalysisMessage("assistant", "궁금한 점을 질문해 주세요. 주요 문제점, 처분사항, 개선방안을 함께 살펴볼 수 있습니다.");
+        analysisInput.focus();
+      }
+
+      function setAnalysisLoading(isLoading) {
+        analysisSend.disabled = isLoading;
+        analysisInput.disabled = isLoading;
+        analysisStatus.hidden = !isLoading;
+        analysisSend.textContent = isLoading ? "답변 작성 중…" : "질문 보내기";
+        analysisMessages.setAttribute("aria-busy", String(isLoading));
+      }
+
+      function appendAnalysisMessage(role, text, sources) {
+        var message = makeElement("article", "analysis-message " + role);
+        message.appendChild(makeElement("strong", "analysis-message-label", role === "user" ? "나의 질문" : "AI 답변"));
+        // Plain text rendering prevents model responses from injecting HTML.
+        message.appendChild(makeElement("p", "analysis-message-text", text));
+        if (Array.isArray(sources) && sources.length) {
+          var sourceArea = makeElement("div", "analysis-sources");
+          sourceArea.appendChild(makeElement("strong", "", "검색된 참고 사례"));
+          var list = document.createElement("ul");
+          sources.forEach(function (source) {
+            list.appendChild(makeElement("li", "", [
+              source.year ? source.year + "년" : "",
+              safeText(source.title, "제목 없음"),
+              safeText(source.sourceFile, "")
+            ].filter(Boolean).join(" · ")));
+          });
+          sourceArea.appendChild(list);
+          message.appendChild(sourceArea);
+        }
+        analysisMessages.appendChild(message);
+        analysisMessages.scrollTop = analysisMessages.scrollHeight;
+        return message;
+      }
+
+      async function sendAnalysisQuestion() {
+        if (activeAnalysisController) return;
+        var question = String(analysisInput.value || "").trim();
+        if (!question || question.length > ${MAX_ASK_LENGTH}) {
+          analysisError.textContent = "질문은 1~${MAX_ASK_LENGTH}자로 입력해 주세요.";
+          analysisError.hidden = false;
+          analysisInput.focus();
           return;
         }
-
-        var textArea =
-          document.createElement("textarea");
-        textArea.value = text;
-        textArea.setAttribute("readonly", "");
-        textArea.style.position = "fixed";
-        textArea.style.left = "-9999px";
-        document.body.appendChild(textArea);
-        textArea.select();
-
-        var copied = document.execCommand("copy");
-        textArea.remove();
-
-        if (!copied) {
-          throw new Error("clipboard copy failed");
+        var controller = new AbortController();
+        activeAnalysisController = controller;
+        var userMessage = appendAnalysisMessage("user", question);
+        analysisError.hidden = true;
+        setAnalysisLoading(true);
+        var completed = false;
+        try {
+          var response = await fetch("/api/ask", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Accept: "application/json" },
+            body: JSON.stringify({ question: question, context: analysisContextText, history: analysisHistory }),
+            signal: controller.signal
+          });
+          var data = await readJsonResponse(response);
+          if (activeAnalysisController !== controller || !analysisDialog.open) return;
+          if (!response.ok || data.success !== true || typeof data.answer !== "string") {
+            throw new Error(data.message || "답변을 불러오지 못했습니다.");
+          }
+          appendAnalysisMessage("assistant", data.answer, data.sources);
+          // Send only three completed turns; the visible transcript stays intact.
+          analysisHistory.push({ role: "user", content: question },
+            { role: "assistant", content: data.answer.slice(0, 2000) });
+          analysisHistory = analysisHistory.slice(-6);
+          analysisInput.value = "";
+          completed = true;
+        } catch (error) {
+          if (activeAnalysisController === controller && error.name !== "AbortError") {
+            analysisError.textContent = error.message || "답변을 불러오지 못했습니다. 다시 시도해 주세요.";
+            analysisError.hidden = false;
+          }
+        } finally {
+          if (!completed) userMessage.remove();
+          if (activeAnalysisController === controller) {
+            activeAnalysisController = null;
+            setAnalysisLoading(false);
+            analysisInput.focus();
+          }
         }
-      }
-
-      function showGptToast(message, isError) {
-        if (gptToastTimer) {
-          clearTimeout(gptToastTimer);
-        }
-
-        gptToast.textContent = message;
-        gptToast.classList.toggle(
-          "error",
-          Boolean(isError)
-        );
-        gptToast.hidden = false;
-        gptToastTimer = setTimeout(function () {
-          gptToast.hidden = true;
-        }, 4500);
       }
 
       async function readJsonResponse(response) {
